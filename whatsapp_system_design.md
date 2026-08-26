@@ -280,16 +280,22 @@ When a message is delivered:
 ```jsonc
 // <- newMessage
 {
-  "eventId": "evt-7002",
-  "deliverySeq": 8804,
-  "messageId": "msg-3021",
-  "chatId": "chat-7",
-  "userId": "user-a",
-  "message": "base64-encrypted-payload",
-  "attachments": ["att-91"],
-  "serverReceivedAt": "2026-08-25T22:10:03.412Z"
+  "eventId": "evt-7002", // (Unique delivery event for this recipient device; used for acknowledgement and deduplication)
+  "deliverySeq": 8804, // (Monotonic per-device sequence used for replay, gap detection, and cumulative acknowledgement)
+  "messageId": "msg-3021", // (Server-assigned message ID shared by every device receiving this message)
+  "chatId": "chat-7", // (Conversation containing the message)
+  "senderId": "user-a", // (User who sent the message, not the recipient)
+  "message": "base64-encrypted-payload", // (Encrypted message content)
+  "attachments": ["att-91"], // (Identifiers for media metadata referenced by the message)
+  "serverReceivedAt": "2026-08-25T22:10:03.412Z" // (Time the server accepted the original message, not successful device-delivery time)
 }
 ```
+
+The recipient is implicit in the WebSocket connection and per-device inbox to
+which this event is sent. Fanout creates a separate delivery event for each
+recipient device. Delivery is confirmed only after that device sends
+`ackEvent`; the server may record that later time separately as
+`acknowledgedAt`.
 
 The source's simplified event response is `"RECEIVED"`. Because WebSocket
 events are asynchronous, a production protocol makes it an explicit command:
