@@ -115,62 +115,261 @@ upload because large binaries should not pass through the chat gateway.
 
 | Direction | Command | Purpose |
 |---|---|---|
-| Client -> server | `CREATE_CHAT` | Create a chat and initial memberships |
-| Client -> server | `SEND_MESSAGE` | Durably submit a message |
-| Server -> client | `MESSAGE_ACCEPTED` | Confirm durable acceptance to sender |
-| Server -> client | `NEW_MESSAGE` | Deliver a message to a device |
-| Client -> server | `ACK_DELIVERY` | Cumulatively acknowledge delivery sequence |
-| Client -> server | `SYNC_INBOX` | Request missed messages after reconnect |
-| Server -> client | `CHAT_UPDATED` | Notify clients of membership changes |
-| Both | `PING` / `PONG` | Detect dead connections quickly |
+| Client -> server | `createChat` | Create a chat and initial memberships |
+| Client -> server | `sendMessage` | Durably submit a message |
+| Client -> server | `createAttachment` | Initialize an attachment |
+| Client -> server | `modifyChatParticipants` | Add or remove a participant |
+| Client -> server | `ackEvent` | Confirm a server event was received |
+| Client -> server | `syncInbox` | Request missed events after reconnect |
+| Server -> client | `chatUpdate` | Notify devices of chat or membership state |
+| Server -> client | `newMessage` | Deliver a message to a device |
+| Server -> client | `syncBatch` | Return a page of missed events |
+| Both | `ping` / `pong` | Detect dead connections quickly |
 
-### Send Example
+State-changing commands produce parallel events for affected devices:
 
-```json
+| Accepted command | Pushed event |
+|---|---|
+| `createChat` | `chatUpdate` to every initial participant device |
+| `modifyChatParticipants` | `chatUpdate` to remaining and newly added participant devices |
+| `sendMessage` | `newMessage` to every recipient device and the sender's other devices |
+| `createAttachment` | No chat event until a later `sendMessage` references the attachment |
+
+Notation used below:
+
+- `-> commandName`: client sends a command to the server.
+- `<- eventName`: server pushes an event to a client.
+- Command responses report whether the server accepted the operation.
+- Server events require an acknowledgement so they can be removed from the
+  recipient device's inbox.
+
+The four baseline command shapes follow the source discussion, with production
+fields added where they clarify retries and failures.
+
+### `createChat`
+
+```jsonc
+// -> createChat
 {
-  "type": "SEND_MESSAGE",
-  "request_id": "req-8f2",
-  "client_message_id": "phone-a:1042",
-  "chat_id": "chat-7",
-  "ciphertext": "base64-encrypted-payload",
-  "attachment_ids": ["att-91"]
+  "requestId": "req-100",
+  "participants": ["user-b", "user-c"],
+  "name": "Weekend trip"
 }
 ```
 
-`client_message_id` makes retries idempotent. The sender receives:
-
-```json
+```jsonc
+// response
 {
-  "type": "MESSAGE_ACCEPTED",
-  "request_id": "req-8f2",
-  "message_id": "msg-3021",
-  "server_received_at": "2026-08-25T22:10:03.412Z"
+  "status": "SUCCESS",
+  "chatId": "chat-7"
 }
 ```
 
-A recipient device receives:
+The server validates the participant limit, persists the chat and memberships,
+then emits `chatUpdate` to every participant device.
 
-```json
+### `sendMessage`
+
+```jsonc
+// -> sendMessage
 {
-  "type": "NEW_MESSAGE",
-  "client_id": "laptop-b",
-  "delivery_seq": 8804,
-  "message": {
-    "message_id": "msg-3021",
-    "chat_id": "chat-7",
-    "sender_id": "user-a",
-    "ciphertext": "base64-encrypted-payload"
-  }
+  "requestId": "req-101",
+  "clientMessageId": "phone-a:1042",
+  "chatId": "chat-7",
+  "message": "base64-encrypted-payload",
+  "attachments": ["att-91"]
 }
 ```
 
-The device can acknowledge a range:
-
-```json
+```jsonc
+// response
 {
-  "type": "ACK_DELIVERY",
-  "client_id": "laptop-b",
-  "ack_through_seq": 8804
+  "status": "SUCCESS",
+  "messageId": "msg-3021",
+  "serverReceivedAt": "2026-08-25T22:10:03.412Z"
+}
+```
+
+`clientMessageId` makes a retried command idempotent. `SUCCESS` means the
+message and fanout event are durable; it does not mean every recipient has
+received the message.
+
+### `createAttachment`
+
+The simple interview version puts the body in the command:
+
+```jsonc
+// -> createAttachment (baseline)
+{
+  "body": "<binary-data>",
+  "hash": "sha256:8f..."
+}
+```
+
+```jsonc
+// response
+{
+  "status": "SUCCESS",
+  "attachmentId": "att-91"
+}
+```
+
+The scalable version sends metadata over WebSocket and uploads bytes directly
+to object storage:
+
+```jsonc
+// -> createAttachment (scalable)
+{
+  "requestId": "req-102",
+  "contentType": "image/jpeg",
+  "sizeBytes": 2482103,
+  "hash": "sha256:8f..."
+}
+```
+
+```jsonc
+// response
+{
+  "status": "SUCCESS",
+  "attachmentId": "att-91",
+  "signedUploadUrl": "https://object-store.example/signed/..."
+}
+```
+
+### `modifyChatParticipants`
+
+```jsonc
+// -> modifyChatParticipants
+{
+  "requestId": "req-103",
+  "chatId": "chat-7",
+  "userId": "user-d",
+  "operation": "ADD"
+}
+```
+
+```jsonc
+// response
+{
+  "status": "SUCCESS",
+  "chatVersion": 12
+}
+```
+
+Valid operations are `ADD` and `REMOVE`. The server checks authorization,
+updates membership, increments `chatVersion`, and emits `chatUpdate`.
+
+### Server Events and Acknowledgements
+
+When a chat is created or its membership changes:
+
+```jsonc
+// <- chatUpdate
+{
+  "eventId": "evt-7001",
+  "deliverySeq": 8803,
+  "chatId": "chat-7",
+  "chatVersion": 12,
+  "name": "Weekend trip",
+  "participants": ["user-a", "user-b", "user-c", "user-d"]
+}
+```
+
+When a message is delivered:
+
+```jsonc
+// <- newMessage
+{
+  "eventId": "evt-7002",
+  "deliverySeq": 8804,
+  "messageId": "msg-3021",
+  "chatId": "chat-7",
+  "userId": "user-a",
+  "message": "base64-encrypted-payload",
+  "attachments": ["att-91"],
+  "serverReceivedAt": "2026-08-25T22:10:03.412Z"
+}
+```
+
+The source's simplified event response is `"RECEIVED"`. Because WebSocket
+events are asynchronous, a production protocol makes it an explicit command:
+
+```jsonc
+// -> ackEvent
+{
+  "clientId": "laptop-b",
+  "eventId": "evt-7002",
+  "status": "RECEIVED"
+}
+```
+
+For efficiency, a device may cumulatively acknowledge an ordered range:
+
+```jsonc
+// -> ackEvent
+{
+  "clientId": "laptop-b",
+  "ackThroughDeliverySeq": 8804,
+  "status": "RECEIVED"
+}
+```
+
+### Reconnect and Heartbeat Additions
+
+```jsonc
+// -> syncInbox
+{
+  "clientId": "laptop-b",
+  "afterDeliverySeq": 8790,
+  "limit": 100
+}
+```
+
+```jsonc
+// <- syncBatch
+{
+  "eventId": "evt-sync-20",
+  "events": ["...chatUpdate/newMessage events..."],
+  "nextDeliverySeq": 8804,
+  "hasMore": false
+}
+```
+
+```jsonc
+// -> ping
+{
+  "sentAt": "2026-08-25T22:10:10Z"
+}
+```
+
+```jsonc
+// <- pong
+{
+  "sentAt": "2026-08-25T22:10:10Z",
+  "serverTime": "2026-08-25T22:10:10.020Z"
+}
+```
+
+### Command Lifecycle
+
+```mermaid
+flowchart LR
+    C["Client command<br/>createChat / sendMessage / modifyChatParticipants"] --> V["Validate and authorize"]
+    V --> D["Persist state + outbox"]
+    D --> R["Return SUCCESS / FAILURE"]
+    D --> F["Fan out parallel server events"]
+    F --> E["chatUpdate / newMessage"]
+    E --> A["Client sends ackEvent: RECEIVED"]
+    A --> X["Advance or delete device inbox entry"]
+```
+
+Example failure response:
+
+```jsonc
+{
+  "status": "FAILURE",
+  "errorCode": "NOT_CHAT_MEMBER",
+  "retryable": false
 }
 ```
 
@@ -247,7 +446,7 @@ transaction boundary, even if the diagram draws them separately.
    within the product limit.
 2. Write the chat record and initial memberships atomically when possible, or
    use an idempotent batched workflow for the largest allowed groups.
-3. Publish `CHAT_UPDATED` only after membership state is durable.
+3. Publish `chatUpdate` only after membership state is durable.
 
 ### 5.1 Send and Deliver a Message
 
@@ -264,20 +463,20 @@ sequenceDiagram
     participant R as Recipient Gateway
     participant C as Recipient Device
 
-    S->>G: SEND_MESSAGE(client_message_id)
+    S->>G: sendMessage(clientMessageId)
     G->>I: Authenticated command
     I->>I: Verify membership and deduplicate
     I->>M: Atomically persist message + outbox event
     M-->>I: Durable commit
-    I-->>S: MESSAGE_ACCEPTED(message_id)
+    I-->>S: sendMessage SUCCESS(messageId)
 
     F->>M: Consume outbox event
     F->>D: Create per-device inbox entries
     F->>P: Publish realtime notification
     P-->>R: Notify connected recipient
     R->>D: Read delivery payload
-    R-->>C: NEW_MESSAGE(delivery_seq)
-    C->>R: ACK_DELIVERY(ack_through_seq)
+    R-->>C: newMessage(deliverySeq)
+    C->>R: ackEvent(ackThroughDeliverySeq)
     R->>D: Delete or advance acknowledged entries
 ```
 
@@ -323,7 +522,7 @@ sequenceDiagram
     M-->>C: attachment_id + signed upload URL
     C->>O: Upload encrypted bytes directly
     C->>M: Complete upload with checksum
-    C->>G: SEND_MESSAGE(attachment_id)
+    C->>G: sendMessage(attachmentId)
     G-->>R: Deliver message metadata
     R->>CDN: Download encrypted object
 ```
@@ -504,9 +703,9 @@ message-delivery critical path.
 
 Alice sends a message to Bob while Bob's phone is online and laptop is offline:
 
-1. Alice sends `client_message_id=phone-a:1042`.
+1. Alice sends `clientMessageId=phone-a:1042`.
 2. The ingest service persists `msg-3021` and an outbox event.
-3. Alice receives `MESSAGE_ACCEPTED`.
+3. Alice receives a successful `sendMessage` response.
 4. Fanout creates one inbox entry for Bob's phone and one for his laptop.
 5. Pub/sub wakes the gateway hosting Bob's phone.
 6. The phone receives and acknowledges the message; its inbox entry is removed.
