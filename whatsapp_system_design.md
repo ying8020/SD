@@ -152,7 +152,7 @@ fields added where they clarify retries and failures.
 // -> createChat
 {
   "requestId": "req-100",
-  "participants": ["user-b", "user-c"],
+  "participants": ["user-a", "user-b", "user-c"],
   "name": "Weekend trip"
 }
 ```
