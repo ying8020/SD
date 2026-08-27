@@ -369,24 +369,85 @@ For efficiency, a device may cumulatively acknowledge an ordered range:
 
 ### Reconnect and Heartbeat Additions
 
+`syncInbox` is initiated by a client after startup, WebSocket reconnection, or
+gap detection. `syncBatch` is the server's paginated response containing events
+from that client's server-side inbox.
+
+Suppose `laptop-b` has durably stored every event through sequence 8802:
+
 ```jsonc
 // -> syncInbox
 {
-  "clientId": "laptop-b",
-  "afterDeliverySeq": 8790,
-  "limit": 100
+  "requestId": "sync-20", // (Correlates this request with the returned syncBatch)
+  "clientId": "laptop-b", // (Device whose server-side inbox should be queried)
+  "afterDeliverySeq": 8802, // (Highest sequence already stored locally by this device)
+  "limit": 100 // (Maximum number of events to return in this page)
 }
 ```
 
 ```jsonc
 // <- syncBatch
 {
-  "eventId": "evt-sync-20",
-  "events": ["...chatUpdate/newMessage events..."],
-  "nextDeliverySeq": 8804,
-  "hasMore": false
+  "requestId": "sync-20", // (Matches the initiating syncInbox request)
+  "events": [
+    {
+      "type": "chatUpdate",
+      "eventId": "evt-7001",
+      "deliverySeq": 8803,
+      "chatId": "chat-7",
+      "chatVersion": 12,
+      "updatedAt": "2026-08-26T22:05:10Z",
+      "name": "Weekend trip",
+      "participants": ["user-a", "user-b", "user-c", "user-d"]
+    },
+    {
+      "type": "newMessage",
+      "eventId": "evt-7002",
+      "deliverySeq": 8804,
+      "messageId": "msg-3021",
+      "chatId": "chat-7",
+      "senderId": "user-a",
+      "message": "base64-encrypted-payload",
+      "attachments": ["att-91"],
+      "serverReceivedAt": "2026-08-25T22:10:03.412Z"
+    }
+  ],
+  "lastDeliverySeq": 8804, // (Highest sequence included in this page)
+  "hasMore": false // (Whether another page remains after lastDeliverySeq)
 }
 ```
+
+The server performs the equivalent of:
+
+```text
+query server-side inbox
+where client_id = "laptop-b"
+  and delivery_seq > 8802
+order by delivery_seq
+limit 100
+```
+
+After persisting both events locally, the laptop cumulatively acknowledges the
+page:
+
+```jsonc
+// -> ackEvent
+{
+  "clientId": "laptop-b",
+  "ackThroughDeliverySeq": 8804,
+  "status": "RECEIVED"
+}
+```
+
+If `hasMore` were `true`, the client would request the next page using
+`afterDeliverySeq: 8804`. If it is `false`, the client has caught up and enters
+normal realtime mode.
+
+| Message | Initiator | Purpose |
+|---|---|---|
+| `syncInbox` | Client device | Ask for events after the device's last locally stored sequence |
+| `syncBatch` | Server | Return one ordered page from that device's server-side inbox |
+| `ackEvent` | Client device | Confirm the page was persisted so acknowledged inbox entries can be removed |
 
 ```jsonc
 // -> ping
