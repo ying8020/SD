@@ -17,11 +17,11 @@ Sending a message has two paths:
 2. **Fast path:** publish a notification so connected devices receive it
    immediately.
 
-The inbox is the delivery source of truth. Pub/sub is only a low-latency hint.
-If a socket or pub/sub delivery fails, a device reconnects and replays its
-inbox. Devices acknowledge received messages, allowing inbox entries to be
-removed. Media bypasses chat servers and moves through object storage and a
-CDN.
+The server-side, per-device inbox is the delivery source of truth. Pub/sub is
+only a low-latency hint. If a socket or pub/sub delivery fails, a device
+reconnects and replays its server-side inbox. Devices acknowledge received
+messages, allowing inbox entries to be removed. Media bypasses chat servers
+and moves through object storage and a CDN.
 
 ## 1. Requirements
 
@@ -88,7 +88,7 @@ dominant write path.
 | Chat | `chat_id`, type, created time |
 | ChatParticipant | `chat_id`, `user_id`, role, joined time |
 | Message | `message_id`, `chat_id`, sender, ciphertext, server time, attachment IDs |
-| InboxEntry | `client_id`, delivery sequence, `message_id`, expiry |
+| InboxEntry | Server-side delivery record containing `client_id`, delivery sequence, `message_id`, and expiry |
 | Attachment | `attachment_id`, object key, size, content type, checksum |
 | Connection | Client-to-gateway association and heartbeat state |
 
@@ -296,6 +296,53 @@ which this event is sent. Fanout creates a separate delivery event for each
 recipient device. Delivery is confirmed only after that device sends
 `ackEvent`; the server may record that later time separately as
 `acknowledgedAt`.
+
+#### `deliverySeq` and the Per-Device Inbox
+
+`deliverySeq` is assigned when the fanout worker creates an entry in a
+recipient device's **server-side inbox**. It is monotonic within that device's
+event stream, not global and not shared across devices.
+
+For one logical message:
+
+| Recipient device | `eventId` | `deliverySeq` | `messageId` |
+|---|---|---:|---|
+| Bob's phone | `evt-phone-8804` | 8804 | `msg-3021` |
+| Bob's laptop | `evt-laptop-206` | 206 | `msg-3021` |
+| Alice's tablet | `evt-tablet-441` | 441 | `msg-3021` |
+
+- `messageId` remains the same because all rows refer to one logical message.
+- `eventId` and `deliverySeq` differ because each device has its own delivery
+  history.
+- A retry to the same device reuses the existing inbox entry, event ID, and
+  sequence rather than allocating a new sequence.
+- Equal sequence values on two devices would be coincidental and unrelated.
+
+The server stores the message once and creates a lightweight delivery entry
+for each device:
+
+```text
+Message Store:
+  msg-3021 -> encrypted message payload
+
+Server-Side Device Inbox:
+  (phone-b, 8804) -> evt-phone-8804 -> msg-3021
+  (laptop-b, 206) -> evt-laptop-206 -> msg-3021
+```
+
+Delivery lifecycle:
+
+1. Fanout writes one server-side inbox entry per recipient device.
+2. If a device is online, its gateway immediately sends `newMessage`.
+3. The device persists the message in its local message database.
+4. The device sends `ackEvent`.
+5. The server deletes or advances that device's acknowledged inbox entries.
+6. An offline device's inbox entries remain until it reconnects or the
+   retention limit expires.
+
+The device's local database stores chat history for the user. The server-side
+inbox stores only pending delivery state and remains authoritative until the
+device acknowledges receipt.
 
 The source's simplified event response is `"RECEIVED"`. Because WebSocket
 events are asynchronous, a production protocol makes it an explicit command:
