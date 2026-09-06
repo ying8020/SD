@@ -224,8 +224,9 @@ flowchart LR
 
 For an immediate notification, the API writes one outbox event per requested
 channel. For future work, the scheduler claims due rows and writes those
-events. For campaigns, fanout workers create the same events in recipient batches.
-The relay then routes them to the appropriate priority and channel queue.
+events. For campaigns, fanout workers create the same events in recipient
+batches. The relay then routes them to the appropriate priority and channel
+queue.
 
 ### Responsibilities
 
@@ -238,9 +239,7 @@ The relay then routes them to the appropriate priority and channel queue.
 | Delivery workers | Check preferences, resolve destinations, call providers, and retry |
 | Status callback | Verify provider webhooks and update delivery state |
 
-## 5. Critical Flows
-
-### 5.1 Immediate or Scheduled Notification
+### 4.1 Workflow for API 1: Send One Notification
 
 ```mermaid
 sequenceDiagram
@@ -253,7 +252,7 @@ sequenceDiagram
     participant W as Delivery Worker
     participant P as Provider
 
-    C->>A: Send notification + idempotency key
+    C->>A: POST /v1/notifications
     A->>D: Transaction: request + durable work marker
     D-->>A: Commit
     A-->>C: 202 Accepted
@@ -267,36 +266,110 @@ sequenceDiagram
 
     D->>Q: Outbox relay publishes ready work
     W->>Q: Claim work item
-    W->>W: Check preferences, quiet hours, destinations
-    W->>D: Suppress or claim unique destination deliveries
-    W->>P: Send eligible deliveries with stable identities
-    P-->>W: Accepted or error
-    W->>D: Persist result
+    W->>D: Load preferences and destinations
+    alt Opted out, in quiet hours, or expired
+        W->>D: Suppress, reschedule, or expire
+    else Eligible
+        W->>D: Claim unique destination deliveries
+        W->>P: Send with stable delivery IDs
+        P-->>W: Accepted or error
+        W->>D: Persist result
+    end
     W->>Q: Acknowledge queue item
 ```
 
-The sender receives success after durable acceptance, not after provider or
-end-user delivery.
+1. Validate the producer, category, recipient, schedule, and idempotency key.
+2. Atomically store the request and its immediate outbox event or future
+   schedule row.
+3. Return success after that commit, not after provider delivery.
+4. At send time, load current preferences and destinations.
+5. Persist each destination delivery before or with its provider attempt.
 
-If the user is in quiet hours, the worker reschedules the notification
-for the end of the quiet period, provided it will not have expired. Preferences
-are checked again when the deferred notification becomes eligible.
+Quiet-hour work is rescheduled only if it remains valid after the quiet period.
+The worker checks preferences again when the notification becomes eligible.
 
-### 5.2 Campaign
+### 4.2 Workflow for API 2: Create a Campaign
 
-1. Store one campaign with its segment version, schedule, content, and expiry.
-2. At launch, resolve the segment into a stable, paged recipient manifest.
-3. Fanout workers claim pages and write unique per-user/channel outbox events.
-4. Delivery workers check current preferences and resolve destinations.
-5. Each worker creates or claims destination deliveries before provider calls.
-6. Pace bulk work using queue age, worker throughput, and provider quotas.
-7. Checkpoint each page so a crashed worker can safely resume.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Campaign Client
+    participant A as Notification API
+    participant D as Database
+    participant S as Scheduler / Fanout
+    participant G as Segment / Manifest Store
+    participant Q as Bulk Queues
+    participant W as Delivery Workers
 
-Do not enqueue all recipients at once. The durable manifest is the campaign
-backlog; fanout should release only as quickly as downstream systems can
-process it.
+    C->>A: POST /v1/campaigns
+    A->>D: Transaction: campaign + durable work marker
+    D-->>A: Commit
+    A-->>C: 202 Accepted
+    S->>D: Claim campaign at sendAt
+    S->>G: Resolve versioned segment
+    G-->>S: Paged recipient manifest
+    loop Bounded pages
+        S->>D: Write recipient/channel outbox + checkpoint
+        D->>Q: Relay bulk work
+        Q->>W: Deliver through API 1 worker path
+    end
+```
 
-### 5.3 Provider Result and Retry
+1. Store one campaign, not one row per recipient, on the API path.
+2. At launch, snapshot the versioned segment into a stable recipient manifest.
+3. Claim and checkpoint manifest pages so a crashed worker can safely resume.
+4. Create unique work keyed by `(campaign_id, user_id, channel)`.
+5. Pace fanout using queue age, worker throughput, and provider quotas.
+
+The manifest is the durable campaign backlog. Do not enqueue all recipients at
+once; release pages only as quickly as downstream systems can process them.
+
+### 4.3 Workflow for API 3: Manage Preferences
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User Client
+    participant A as Preference API
+    participant D as Preference DB
+    participant C as Cache
+    participant W as Delivery Worker
+
+    alt Read preferences
+        U->>A: GET /v1/users/{id}/preferences
+        A->>C: Read cached preferences
+        C-->>A: Value or miss
+        opt Cache miss
+            A->>D: Read preferences
+            D-->>A: Current version
+            A->>C: Cache current version
+        end
+        A-->>U: 200 current preferences
+    else Update preferences
+        U->>A: PUT preferences with version
+        A->>D: Conditional update
+        D-->>A: New version
+        A->>C: Invalidate cached value
+        A-->>U: 200 updated preferences
+    end
+
+    W->>C: Read latest preference version near send time
+    C-->>W: Value or miss
+    opt Cache miss
+        W->>D: Read preferences
+    end
+    W->>W: Send, suppress, defer, or expire
+```
+
+1. `GET` returns category-level channel settings, timezone, and quiet hours.
+2. `PUT` uses optimistic concurrency to prevent lost updates.
+3. Cache invalidation follows a successful database commit.
+4. Delivery workers evaluate the latest preference near provider dispatch,
+   not only when a notification or campaign was created.
+5. Server-controlled category policy decides which messages may bypass an
+   opt-out or quiet hours.
+
+## 5. Shared Provider Result and Retry Flow
 
 ```mermaid
 flowchart TD
@@ -517,12 +590,13 @@ idempotent writes make duplicates rare and harmless inside the platform.
 | 0-5 min | Clarify channels, scheduling, campaign behavior, and delivery meaning |
 | 5-10 min | Functional requirements, non-functional requirements, and capacity |
 | 10-15 min | Core entities and APIs |
-| 15-27 min | Draw the high-level design and trace one notification |
-| 27-33 min | Explain scheduling, campaigns, preferences, and quiet hours |
-| 33-40 min | Deep dive 1: reliable acceptance and recovery |
-| 40-47 min | Deep dive 2: urgent latency and priority isolation |
-| 47-54 min | Deep dive 3: at-least-once delivery and deduplication |
-| 54-59 min | Deep dive 4: scheduled campaigns and burst scaling |
+| 15-24 min | Overview plus API 1 immediate/scheduled workflow |
+| 24-30 min | API 2 campaign workflow |
+| 30-35 min | API 3 preference workflow |
+| 35-41 min | Deep dive 1: reliable acceptance and recovery |
+| 41-47 min | Deep dive 2: urgent latency and priority isolation |
+| 47-53 min | Deep dive 3: at-least-once delivery and deduplication |
+| 53-59 min | Deep dive 4: scheduled campaigns and burst scaling |
 | 59-60 min | Summarize tradeoffs |
 
 If time is limited, prioritize the acceptance invariant, priority isolation,
