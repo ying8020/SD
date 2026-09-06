@@ -224,9 +224,8 @@ flowchart LR
 
 For an immediate notification, the API writes one outbox event per requested
 channel. For future work, the scheduler claims due rows and writes those
-events. For campaigns, fanout workers create the same events in recipient
-batches. The relay then routes them to the appropriate priority and channel
-queue.
+events. For campaigns, fanout workers create the same events in recipient batches.
+The relay then routes them to the appropriate priority and channel queue.
 
 ### Responsibilities
 
@@ -269,8 +268,8 @@ sequenceDiagram
     D->>Q: Outbox relay publishes ready work
     W->>Q: Claim work item
     W->>W: Check preferences, quiet hours, destinations
-    W->>D: Create or claim unique delivery
-    W->>P: Send with stable delivery identity
+    W->>D: Suppress or claim unique destination deliveries
+    W->>P: Send eligible deliveries with stable identities
     P-->>W: Accepted or error
     W->>D: Persist result
     W->>Q: Acknowledge queue item
@@ -287,10 +286,11 @@ are checked again when the deferred notification becomes eligible.
 
 1. Store one campaign with its segment version, schedule, content, and expiry.
 2. At launch, resolve the segment into a stable, paged recipient manifest.
-3. Fanout workers claim pages and create deliveries with unique keys.
-4. Check each user's latest preferences before queueing a delivery.
-5. Pace bulk work using queue age, worker throughput, and provider quotas.
-6. Checkpoint each page so a crashed worker can safely resume.
+3. Fanout workers claim pages and write unique per-user/channel outbox events.
+4. Delivery workers check current preferences and resolve destinations.
+5. Each worker creates or claims destination deliveries before provider calls.
+6. Pace bulk work using queue age, worker throughput, and provider quotas.
+7. Checkpoint each page so a crashed worker can safely resume.
 
 Do not enqueue all recipients at once. The durable manifest is the campaign
 backlog; fanout should release only as quickly as downstream systems can
@@ -328,11 +328,11 @@ state transitions, and outbox creation benefit from transactions.
 | `delivery_attempts` | PK `(delivery_id, attempt_number)` |
 | `outbox_events` | PK `event_id`; index `(published_at, created_at)` |
 
-Use these uniqueness constraints to make fanout and retries safe:
+Use stable logical keys to make fanout and retries safe:
 
 ```text
-single notification: (notification_id, destination_id)
-campaign:            (campaign_id, user_id, destination_id)
+ready work: (source_type, source_id, user_id, channel)
+delivery:   (source_type, source_id, destination_id)
 ```
 
 Large campaign recipient manifests can live in object storage or a
@@ -341,9 +341,11 @@ wide-column store because workers consume them sequentially by page.
 ### Delivery States
 
 ```text
-ACCEPTED -> SCHEDULED -> QUEUED -> SENDING -> PROVIDER_ACCEPTED
-                                \-> SUPPRESSED
-                                \-> EXPIRED
+ACCEPTED -> SCHEDULED -> QUEUED
+ACCEPTED ------------> QUEUED
+QUEUED  -> SUPPRESSED
+QUEUED  -> EXPIRED
+QUEUED  -> SENDING -> PROVIDER_ACCEPTED
 SENDING  -> RETRY_SCHEDULED -> QUEUED
 SENDING  -> FAILED_PERMANENT
 PROVIDER_ACCEPTED -> DELIVERED
@@ -435,7 +437,7 @@ timeouts. Deduplicate at each boundary:
 |---|---|
 | Producer retries | `(producer_id, idempotency_key)` |
 | Outbox republishes | `event_id` |
-| Campaign page repeats | `(campaign_id, user_id, destination_id)` |
+| Campaign page repeats | `(campaign_id, user_id, channel)` |
 | Queue redelivers | `event_id`, unique delivery key, and conditional state |
 | Provider callback repeats | `(provider, provider_event_id)` |
 
