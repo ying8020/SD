@@ -210,164 +210,150 @@ other. Both endpoints return the current preference object with `200 OK`.
 
 ```mermaid
 flowchart LR
-    A["Product Services"] --> API["Notification API"]
-    API --> DB[("Notification DB<br/>requests + schedules + outbox")]
+    A["Product Services"] --> API["API Layer<br/>notification | campaign | preferences"]
+    U["User Clients"] --> API
+
+    API --> DB[("Primary Store<br/>requests + schedules + deliveries + outbox")]
+    API --> UD[("User Data<br/>preferences + destinations + segments<br/>MySQL/DynamoDB + Redis")]
+
     DB <--> SF["Scheduler / Campaign Fanout"]
+    SF --> UD
+    SF <--> M[("Campaign Manifests")]
     DB --> R["Outbox Relay"]
-    R --> Q["Durable Ready Queues<br/>by priority and channel"]
+    R --> Q["Durable Queues<br/>by priority and channel"]
     Q --> W["Delivery Workers"]
-    W --> P[("Preferences + Destinations")]
-    W --> X["External Providers"]
-    X --> C["Status Callbacks"]
-    C --> DB
+    W --> UD
+    W --> X["Push / Email / SMS Providers"]
+    X --> CB["Callback Handler"]
+    CB --> DB
 ```
 
-For an immediate notification, the API writes one outbox event per requested
-channel. For future work, the scheduler claims due rows and writes those
-events. For campaigns, fanout workers create the same events in recipient
-batches. The relay then routes them to the appropriate priority and channel
-queue.
+This is one asynchronous pipeline. The three workflows below use subsets of
+these same components; they do not introduce separate architectures.
 
-### Responsibilities
+### Concrete Component Choices
 
-| Component | Responsibility |
-|---|---|
-| Notification API | Authenticate, validate, deduplicate, and durably accept requests |
-| Notification DB + outbox | Store requests, schedules, deliveries, and unpublished events |
-| Scheduler / campaign fanout | Release due work and expand campaign segments in bounded pages |
-| Durable queues | Buffer work and isolate priority and channel failures |
-| Delivery workers | Check preferences, resolve destinations, call providers, and retry |
-| Status callback | Verify provider webhooks and update delivery state |
+| Component | Default choice | Why / alternative |
+|---|---|---|
+| API layer | Stateless services behind an API gateway | Easy horizontal scaling; language and framework are not important |
+| Primary store | MySQL or PostgreSQL | Transactions and unique constraints simplify idempotency and the outbox; DynamoDB is an alternative for known access patterns at larger scale |
+| User data | MySQL or DynamoDB, with optional Redis cache | The database remains authoritative; Redis reduces repeated preference and destination reads |
+| Outbox relay | Batched database polling | Simple and reliable at this scale; change-data capture is an alternative at higher throughput |
+| Queue | SQS Standard | Managed at-least-once work queues, visibility timeouts, and DLQs; Kafka is a good alternative when replay and stream retention matter |
+| Scheduler | Sharded due-time table with leased polling | Works with the primary database; EventBridge Scheduler or Cloud Tasks can replace it at moderate scale |
+| Campaign manifest | S3 or another object store | Cheap storage and sequential page reads for large recipient snapshots |
+| Delivery workers | Stateless containers or serverless workers | Scale independently by channel and priority |
+| Providers | FCM/APNs, SES/SendGrid, and Twilio | Avoid building carrier, mail, and mobile push networks |
+
+The concrete interview design uses **MySQL + transactional outbox, Redis as an
+optional cache, SQS queues, and S3 campaign manifests**. These are examples,
+not requirements: DynamoDB and Kafka can satisfy the same roles with different
+operational tradeoffs.
 
 ### 4.1 Workflow for API 1: Send One Notification
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Product Service
-    participant A as Notification API
-    participant D as Database + Outbox
-    participant S as Scheduler
-    participant Q as Delivery Queue
-    participant W as Delivery Worker
-    participant P as Provider
-
-    C->>A: POST /v1/notifications
-    A->>D: Transaction: request + durable work marker
-    D-->>A: Commit
-    A-->>C: 202 Accepted
-
-    alt Future sendAt
-        S->>D: Claim due schedule row
-        S->>D: Write delivery outbox events
-    else Immediate
-        Note over A,D: Outbox events were committed with the request
-    end
-
-    D->>Q: Outbox relay publishes ready work
-    W->>Q: Claim work item
-    W->>D: Load preferences and destinations
-    alt Opted out, in quiet hours, or expired
-        W->>D: Suppress, reschedule, or expire
-    else Eligible
-        W->>D: Claim unique destination deliveries
-        W->>P: Send with stable delivery IDs
-        P-->>W: Accepted or error
-        W->>D: Persist result
-    end
-    W->>Q: Acknowledge queue item
+flowchart LR
+    A["Product Service"] --> API["API Layer"]
+    API --> DB[("Primary Store + Outbox")]
+    DB -->|"immediate via relay"| Q["Durable Queue"]
+    DB -->|"future"| S["Scheduler"]
+    S -->|"due event via relay"| Q
+    Q --> W["Delivery Worker"]
+    W --> UD[("User Data")]
+    W --> P["Push / Email / SMS Provider"]
 ```
 
-1. Validate the producer, category, recipient, schedule, and idempotency key.
-2. Atomically store the request and its immediate outbox event or future
-   schedule row.
-3. Return success after that commit, not after provider delivery.
-4. At send time, load current preferences and destinations.
-5. Persist each destination delivery before or with its provider attempt.
+1. **Accept the request.** The API authenticates the producer, validates the
+   recipient and schedule, and verifies that the producer may use the requested
+   category and priority.
+2. **Deduplicate it.** A unique `(producer_id, idempotency_key)` constraint
+   returns the original notification for safe producer retries.
+3. **Persist before responding.** For immediate work, one MySQL transaction
+   stores the notification and outbox event. For future work, it stores the
+   notification and indexed schedule row. Only then does the API return
+   `202 Accepted`.
+4. **Release the work.** The outbox relay publishes immediate work to SQS.
+   The scheduler claims future rows with leases and writes equivalent outbox
+   events when `sendAt` arrives.
+5. **Choose the actual destinations.** A worker reads current preferences and
+   email, phone, or device-token records. Redis may serve this read, but the
+   worker falls back to the authoritative database.
+6. **Apply policy.** The worker suppresses an opt-out, expires stale work, or
+   reschedules until quiet hours end. Deferred work is checked again later.
+7. **Send and record.** The worker conditionally creates each destination
+   delivery, calls the provider adapter, stores the result, and acknowledges
+   the queue message.
 
-Quiet-hour work is rescheduled only if it remains valid after the quiet period.
-The worker checks preferences again when the notification becomes eligible.
+**Why these choices:** the database transaction makes acceptance durable; the
+outbox closes the database-to-queue failure gap; SQS absorbs bursts and
+redelivers after worker failure; stateless workers scale by queue depth; and
+late preference evaluation honors changes made after scheduling.
 
 ### 4.2 Workflow for API 2: Create a Campaign
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Campaign Client
-    participant A as Notification API
-    participant D as Database
-    participant S as Scheduler / Fanout
-    participant G as Segment / Manifest Store
-    participant Q as Bulk Queues
-    participant W as Delivery Workers
-
-    C->>A: POST /v1/campaigns
-    A->>D: Transaction: campaign + durable work marker
-    D-->>A: Commit
-    A-->>C: 202 Accepted
-    S->>D: Claim campaign at sendAt
-    S->>G: Resolve versioned segment
-    G-->>S: Paged recipient manifest
-    loop Bounded pages
-        S->>D: Write recipient/channel outbox + checkpoint
-        D->>Q: Relay bulk work
-        Q->>W: Deliver through API 1 worker path
-    end
+flowchart LR
+    A["Product Service"] --> API["API Layer"]
+    API --> DB[("Primary Store")]
+    DB --> SF["Scheduler / Campaign Fanout"]
+    SF --> UD[("User Data")]
+    SF --> M[("S3 Manifest")]
+    SF -->|"outbox + relay"| Q["Bulk Queues"]
+    Q --> W["Delivery Workers"]
+    W --> UD
+    W --> P["Push / Email / SMS Providers"]
 ```
 
-1. Store one campaign, not one row per recipient, on the API path.
-2. At launch, snapshot the versioned segment into a stable recipient manifest.
-3. Claim and checkpoint manifest pages so a crashed worker can safely resume.
-4. Create unique work keyed by `(campaign_id, user_id, channel)`.
-5. Pace fanout using queue age, worker throughput, and provider quotas.
+1. **Accept one campaign.** The API stores the content, segment version,
+   schedule, expiry, and idempotency key. It does not synchronously create a
+   row for every user.
+2. **Start at the scheduled time.** The scheduler claims the campaign with a
+   lease so only one active owner expands it.
+3. **Snapshot the audience.** The fanout service queries the versioned segment
+   and writes a paged manifest to S3. This provides a stable answer to "who was
+   targeted?" and makes retries deterministic.
+4. **Expand in pages.** Workers claim manifest pages, write unique
+   `(campaign_id, user_id, channel)` outbox events, and checkpoint progress.
+5. **Apply backpressure.** The fanout rate follows SQS queue age, worker
+   throughput, and provider quotas. It slows rather than flooding the broker.
+6. **Reuse normal delivery.** Each recipient enters the same preference check,
+   destination lookup, provider call, and retry path used by API 1.
 
-The manifest is the durable campaign backlog. Do not enqueue all recipients at
-once; release pages only as quickly as downstream systems can process them.
+**Why these choices:** S3 is cheaper than copying a large audience into the
+transactional database; paged fanout avoids a million-row request path;
+checkpoints make crashes recoverable; and separate bulk queues keep campaigns
+from consuming capacity reserved for urgent notifications.
 
 ### 4.3 Workflow for API 3: Manage Preferences
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant U as User Client
-    participant A as Preference API
-    participant D as Preference DB
-    participant C as Cache
-    participant W as Delivery Worker
-
-    alt Read preferences
-        U->>A: GET /v1/users/{id}/preferences
-        A->>C: Read cached preferences
-        C-->>A: Value or miss
-        opt Cache miss
-            A->>D: Read preferences
-            D-->>A: Current version
-            A->>C: Cache current version
-        end
-        A-->>U: 200 current preferences
-    else Update preferences
-        U->>A: PUT preferences with version
-        A->>D: Conditional update
-        D-->>A: New version
-        A->>C: Invalidate cached value
-        A-->>U: 200 updated preferences
-    end
-
-    W->>C: Read latest preference version near send time
-    C-->>W: Value or miss
-    opt Cache miss
-        W->>D: Read preferences
-    end
-    W->>W: Send, suppress, defer, or expire
+flowchart LR
+    U["User Client"] --> API["API Layer"]
+    API --> UD[("User Data<br/>DB + Redis cache")]
+    W["Delivery Worker"] --> UD
+    W -->|"when allowed"| P["Push / Email / SMS Provider"]
 ```
 
-1. `GET` returns category-level channel settings, timezone, and quiet hours.
-2. `PUT` uses optimistic concurrency to prevent lost updates.
-3. Cache invalidation follows a successful database commit.
-4. Delivery workers evaluate the latest preference near provider dispatch,
-   not only when a notification or campaign was created.
-5. Server-controlled category policy decides which messages may bypass an
-   opt-out or quiet hours.
+1. **Read preferences.** `GET` checks Redis first and loads MySQL or DynamoDB
+   on a cache miss. It returns category-level channel settings, timezone, quiet
+   hours, and a version.
+2. **Update safely.** `PUT` conditionally writes the database using `version`
+   or `If-Match`. A stale writer receives a conflict rather than overwriting a
+   newer choice.
+3. **Refresh the cache.** After the database commit, invalidate the Redis key.
+   A short TTL bounds stale reads if invalidation is delayed.
+4. **Enforce near dispatch.** Delivery workers read the latest preference
+   immediately before sending, so a user can opt out after a campaign was
+   scheduled.
+5. **Apply central policy.** The platform decides whether each category is
+   suppressible, deferrable during quiet hours, or mandatory. Callers cannot
+   label marketing traffic as security traffic.
+
+**Why these choices:** the database provides durable consent history and
+optimistic concurrency; Redis reduces hot read load but is never the source of
+truth; and checking near dispatch provides stronger opt-out behavior than
+checking only when the notification is created.
 
 ## 5. Shared Provider Result and Retry Flow
 
