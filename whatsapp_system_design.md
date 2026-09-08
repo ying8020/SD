@@ -1,98 +1,97 @@
 # WhatsApp-Like Messaging System
 
-This is an original, condensed discussion guide inspired by the structure and
-topics in [Hello Interview's WhatsApp breakdown][source]. It focuses on
-reasoning, examples, and tradeoffs rather than reproducing the source.
+This is an original interview guide inspired by the structure and topics in
+[Hello Interview's WhatsApp breakdown][source]. It focuses on the decisions
+most useful in a 60-minute system design interview rather than reproducing the
+source.
 
 [source]: https://www.hellointerview.com/learn/system-design/problem-breakdowns/whatsapp
 
-Source reviewed: 2026-08-25.
+Source reviewed: 2026-09-08.
 
 ## 0. One-Minute Design
 
-Clients maintain TLS WebSocket connections to a fleet of chat gateways.
-Sending a message has two paths:
+Clients maintain TLS WebSocket connections to a fleet of chat gateways behind
+an L4 load balancer. A send command is acknowledged only after the message and
+a durable fanout event are stored.
 
-1. **Durable path:** persist the message and create per-device inbox entries.
-2. **Fast path:** publish a notification so connected devices receive it
-   immediately.
+Fanout workers resolve chat participants and their active devices, then create
+one durable inbox entry per destination device. Only after that do they publish
+a realtime hint through Redis Pub/Sub. A connected gateway pushes the event
+immediately; an offline or disconnected device replays its inbox later.
 
-The server-side, per-device inbox is the delivery source of truth. Pub/sub is
-only a low-latency hint. If a socket or pub/sub delivery fails, a device
-reconnects and replays its server-side inbox. Devices acknowledge received
-messages, allowing inbox entries to be removed. Media bypasses chat servers
-and moves through object storage and a CDN.
+Each device durably stores received messages in a local database and
+acknowledges a contiguous delivery sequence. The server can then remove the
+acknowledged inbox entries. Pub/sub provides low latency, while the per-device
+inbox provides reliable, at-least-once delivery.
+
+Media bytes bypass the chat path. Clients upload encrypted files directly to
+object storage using signed HTTP URLs and send only attachment metadata through
+the WebSocket.
 
 ## 1. Requirements
 
 ### Functional
 
-1. Create one-to-one and group chats, with at most 100 participants.
+1. Start one-to-one or group chats with at most 100 participants.
 2. Send and receive text messages.
-3. Deliver messages sent while a device is offline, for up to 30 days.
+3. Receive messages sent while a device was offline, for up to 30 days.
 4. Send and receive media attachments.
-5. Synchronize multiple devices belonging to one user.
 
 ### Out of Scope
 
-- Voice and video calling.
+- Audio and video calls.
 - Business messaging.
 - Registration and profile management.
-- Read receipts, typing indicators, and reactions.
-- Full key-management design for end-to-end encryption.
-- Spam, abuse, and contact discovery.
+- Read receipts, typing indicators, reactions, and presence.
+- Full end-to-end encryption key management.
+- Spam, scraping, and contact discovery.
 
 ### Non-Functional
 
-| Goal | Target / interpretation |
+| Goal | Target |
 |---|---|
-| Online delivery latency | p95 below 500 ms when both users are connected |
-| Delivery | Every durably accepted message eventually reaches each active recipient device |
-| Scale | Billions of accounts and hundreds of millions of concurrent sockets |
-| Availability | A gateway, pub/sub node, or worker failure must not lose accepted messages |
-| Storage | Retain undelivered messages for at most 30 days; keep media outside the message database |
-| Security | TLS in transit; message payload can be opaque client-encrypted ciphertext |
+| Online latency | p95 under 500 ms when sender and recipient are connected |
+| Reliability | Every durably accepted message eventually reaches each active recipient device despite component failures |
+| Scale | Billions of accounts, about 200 million concurrent connections, and tens of thousands of messages/second |
+| Retention efficiency | Deliver offline messages for up to 30 days, logically expire them after that window, and keep media outside the message database |
 
-### Example Capacity Estimate
+The delivery promise is bounded by active devices and the 30-day retention
+window. It does not guarantee that a human reads a message.
+
+### Capacity Estimate
 
 Assume:
 
 - 200 million daily active users.
-- 20 messages per user per day.
-- Five times average traffic at peak.
+- 20 messages sent per user per day.
+- Up to three active devices per user.
 
 ```text
-4 billion messages/day
-  / 86,400 seconds
+200,000,000 users x 20 messages/day
+  = 4 billion messages/day
+
+4,000,000,000 / 86,400
   ~= 46,000 messages/second average
-  ~= 230,000 messages/second peak
 ```
 
-Delivery work is larger than message-ingest work:
-
-```text
-delivery writes per message
-  = recipient count x active devices per recipient
-```
-
-A 50-person chat with two devices per recipient may produce approximately 100
-delivery tasks from one message. Fanout, not message creation, is likely the
-dominant write path.
+A one-to-one message usually creates one message write and one or more inbox
+writes. Including groups and multiple devices, roughly 100,000 writes/second
+is a useful baseline. The fleet must also maintain about 200 million long-lived
+connections; socket capacity and fanout are separate scaling concerns.
 
 ## 2. Core Entities
 
-| Entity | Important fields |
+| Entity | Purpose |
 |---|---|
-| User | `user_id`, account status |
-| Client | `client_id`, `user_id`, device status, last active time |
-| Chat | `chat_id`, type, created time |
-| ChatParticipant | `chat_id`, `user_id`, role, joined time |
-| Message | `message_id`, `chat_id`, sender, ciphertext, server time, attachment IDs |
-| InboxEntry | Server-side delivery record containing `client_id`, delivery sequence, `message_id`, and expiry |
-| Attachment | `attachment_id`, object key, size, content type, checksum |
-| Connection | Client-to-gateway association and heartbeat state |
-
-### Relationships
+| User | Account that participates in chats |
+| Client | One linked phone, tablet, or computer belonging to a user |
+| Chat | One-to-one or group conversation with a maximum of 100 participants |
+| ChatParticipant | Membership, role, join time, and membership version |
+| Message | One logical text or media message stored once |
+| InboxEntry | Pending delivery of an event to one client device |
+| Attachment | Metadata and object-storage location for an uploaded media file |
+| OutboxEvent | Durable handoff from accepted state to asynchronous fanout |
 
 ```mermaid
 erDiagram
@@ -102,55 +101,44 @@ erDiagram
     CHAT ||--o{ MESSAGE : contains
     USER ||--o{ MESSAGE : sends
     MESSAGE ||--o{ ATTACHMENT : references
-    CLIENT ||--o{ INBOX_ENTRY : receives
     MESSAGE ||--o{ INBOX_ENTRY : delivered_as
+    CLIENT ||--o{ INBOX_ENTRY : receives
+    MESSAGE ||--o{ OUTBOX_EVENT : emits
 ```
 
-## 3. Interfaces
+A `Message` is shared conversation data. An `InboxEntry` is device-specific
+delivery state:
 
-Use WebSockets for high-frequency bidirectional commands. Use HTTP for media
-upload because large binaries should not pass through the chat gateway.
+```text
+msg-3021 -> one logical encrypted message
 
-### WebSocket Commands
+phone-b  -> pending delivery of msg-3021
+laptop-b -> pending delivery of msg-3021
+```
 
-| Direction | Command | Purpose |
-|---|---|---|
-| Client -> server | `createChat` | Create a chat and initial memberships |
-| Client -> server | `sendMessage` | Durably submit a message |
-| Client -> server | `createAttachment` | Initialize an attachment |
-| Client -> server | `modifyChatParticipants` | Add or remove a participant |
-| Client -> server | `ackEvent` | Confirm a server event was received |
-| Client -> server | `syncInbox` | Request missed events after reconnect |
-| Server -> client | `chatUpdate` | Notify devices of chat or membership state |
-| Server -> client | `newMessage` | Deliver a message to a device |
-| Server -> client | `syncBatch` | Return a page of missed events |
-| Both | `ping` / `pong` | Detect dead connections quickly |
+Bob's phone can acknowledge the message without deleting the laptop's pending
+delivery.
 
-State-changing commands produce parallel events for affected devices:
+## 3. APIs
 
-| Accepted command | Pushed event |
+WebSockets carry small, frequent, bidirectional chat commands and events. HTTP
+is used for large media uploads. The client authenticates during the WebSocket
+handshake with a short-lived token, and the server binds the connection to a
+`user_id` and `client_id`.
+
+| Functional requirement | API |
 |---|---|
-| `createChat` | `chatUpdate` to every initial participant device |
-| `modifyChatParticipants` | `chatUpdate` to remaining and newly added participant devices |
-| `sendMessage` | `newMessage` to every recipient device and the sender's other devices |
-| `createAttachment` | No chat event until a later `sendMessage` references the attachment |
+| Create a chat | `createChat` WebSocket command |
+| Send and receive messages | `sendMessage`, `newMessage`, and `ackEvent` WebSocket messages |
+| Replay offline messages | `syncInbox`, `syncBatch`, and `ackEvent` WebSocket messages |
+| Transfer media | Attachment HTTP endpoints plus `sendMessage(attachmentId)` |
 
-Notation used below:
-
-- `-> commandName`: client sends a command to the server.
-- `<- eventName`: server pushes an event to a client.
-- Command responses report whether the server accepted the operation.
-- Server events require an acknowledgement so they can be removed from the
-  recipient device's inbox.
-
-The four baseline command shapes follow the source discussion, with production
-fields added where they clarify retries and failures.
-
-### `createChat`
+### Functional Requirement 1: Create a Chat
 
 ```jsonc
-// -> createChat
+// Client -> server
 {
+  "type": "createChat",
   "requestId": "req-100",
   "participants": ["user-a", "user-b", "user-c"],
   "name": "Weekend trip"
@@ -158,704 +146,647 @@ fields added where they clarify retries and failures.
 ```
 
 ```jsonc
-// response
+// Server -> requesting client
 {
+  "requestId": "req-100",
   "status": "SUCCESS",
-  "chatId": "chat-7"
+  "chatId": "chat-7",
+  "chatVersion": 1
 }
 ```
 
-The server validates the participant limit, persists the chat and memberships,
-then emits `chatUpdate` to every participant device.
+`requestId` correlates the asynchronous response. The server stores the result
+under `(client_id, requestId)`, making a retried command idempotent. The
+authenticated creator is implicit and must be included in the final
+membership. The server rejects duplicate participants and groups larger than
+100.
 
-### `sendMessage`
+A later `modifyChatParticipants` command can add or remove members using the
+same authorization and versioning model, but it is not required for the core
+interview scope.
+
+### Functional Requirement 2: Send and Receive a Message
 
 ```jsonc
-// -> sendMessage
+// Client -> server
 {
+  "type": "sendMessage",
   "requestId": "req-101",
   "clientMessageId": "phone-a:1042",
   "chatId": "chat-7",
   "message": "base64-encrypted-payload",
-  "attachments": ["att-91"]
+  "attachmentIds": []
 }
 ```
 
 ```jsonc
-// response
+// Server -> sender after durable acceptance
 {
+  "requestId": "req-101",
   "status": "SUCCESS",
   "messageId": "msg-3021",
-  "serverReceivedAt": "2026-08-25T22:10:03.412Z"
+  "serverReceivedAt": "2026-09-08T18:10:03.412Z"
 }
 ```
 
-`clientMessageId` makes a retried command idempotent. `SUCCESS` means the
-message and fanout event are durable; it does not mean every recipient has
-received the message.
+`clientMessageId` is generated by the sending device and deduplicates a retry.
+`SUCCESS` means the message and fanout intent are durable; it does not mean
+every recipient has received the message.
 
-### `createAttachment`
-
-The simple interview version puts the body in the command:
+Each destination device later receives its own event:
 
 ```jsonc
-// -> createAttachment (baseline)
+// Server -> recipient device
 {
-  "body": "<binary-data>",
-  "hash": "sha256:8f..."
+  "type": "newMessage",
+  "eventId": "evt-laptop-8804",
+  "deliverySeq": 8804,
+  "messageId": "msg-3021",
+  "chatId": "chat-7",
+  "senderId": "user-a",
+  "message": "base64-encrypted-payload",
+  "attachmentIds": [],
+  "serverReceivedAt": "2026-09-08T18:10:03.412Z"
+}
+```
+
+After storing it locally, the device acknowledges the highest contiguous
+sequence it has persisted:
+
+```jsonc
+// Client -> server
+{
+  "type": "ackEvent",
+  "ackThroughDeliverySeq": 8804
+}
+```
+
+The recipient is implicit in the authenticated WebSocket connection.
+
+### Functional Requirement 3: Replay Offline Messages
+
+After connecting or detecting a sequence gap, a device requests the events
+after its local cursor:
+
+```jsonc
+// Client -> server
+{
+  "type": "syncInbox",
+  "requestId": "sync-20",
+  "afterDeliverySeq": 8802,
+  "limit": 100
 }
 ```
 
 ```jsonc
-// response
+// Server -> client
 {
-  "status": "SUCCESS",
-  "attachmentId": "att-91"
+  "type": "syncBatch",
+  "requestId": "sync-20",
+  "events": [
+    {
+      "eventId": "evt-laptop-8803",
+      "deliverySeq": 8803,
+      "messageId": "msg-3020",
+      "chatId": "chat-2"
+    },
+    {
+      "eventId": "evt-laptop-8804",
+      "deliverySeq": 8804,
+      "messageId": "msg-3021",
+      "chatId": "chat-7"
+    }
+  ],
+  "oldestAvailableDeliverySeq": 8803,
+  "historyTruncated": false,
+  "lastDeliverySeq": 8804,
+  "hasMore": false
 }
 ```
 
-The scalable version sends metadata over WebSocket and uploads bytes directly
-to object storage:
+The device stores the page in one local transaction and sends
+`ackThroughDeliverySeq: 8804`. If `hasMore` is true, it requests the next page
+after 8804 before entering realtime mode. If the requested cursor is older
+than the 30-day window, the server sets `historyTruncated: true` and reports
+the oldest available sequence so the client can explicitly accept the
+retention gap rather than treating it as packet loss.
 
-```jsonc
-// -> createAttachment (scalable)
+### Functional Requirement 4: Send and Receive Media
+
+```http
+POST /v1/attachments/init
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
 {
-  "requestId": "req-102",
   "contentType": "image/jpeg",
   "sizeBytes": 2482103,
-  "hash": "sha256:8f..."
+  "sha256": "8f..."
 }
 ```
 
-```jsonc
-// response
+```json
 {
-  "status": "SUCCESS",
   "attachmentId": "att-91",
   "signedUploadUrl": "https://object-store.example/signed/..."
 }
 ```
 
-### `modifyChatParticipants`
+The client uploads bytes directly and then completes the attachment:
 
-```jsonc
-// -> modifyChatParticipants
+```http
+PUT <signedUploadUrl>
+POST /v1/attachments/att-91/complete
+```
+
+After the service validates the size and checksum and marks the attachment
+`READY`, the client sends a normal `sendMessage` containing:
+
+```json
 {
-  "requestId": "req-103",
-  "chatId": "chat-7",
-  "userId": "user-d",
-  "operation": "ADD"
+  "attachmentIds": ["att-91"]
 }
 ```
 
-```jsonc
-// response
-{
-  "status": "SUCCESS",
-  "chatVersion": 12
-}
-```
-
-Valid operations are `ADD` and `REMOVE`. The server checks authorization,
-updates membership, increments `chatVersion`, and emits `chatUpdate`.
-
-### Server Events and Acknowledgements
-
-When a chat is created or its membership changes:
-
-```jsonc
-// <- chatUpdate
-{
-  "eventId": "evt-7001",
-  "deliverySeq": 8803,
-  "chatId": "chat-7",
-  "chatVersion": 12,
-  "name": "Weekend trip",
-  "participants": ["user-a", "user-b", "user-c", "user-d"]
-}
-```
-
-When a message is delivered:
-
-```jsonc
-// <- newMessage
-{
-  "eventId": "evt-7002", // (Unique delivery event for this recipient device; used for acknowledgement and deduplication)
-  "deliverySeq": 8804, // (Monotonic per-device sequence used for replay, gap detection, and cumulative acknowledgement)
-  "messageId": "msg-3021", // (Server-assigned message ID shared by every device receiving this message)
-  "chatId": "chat-7", // (Conversation containing the message)
-  "senderId": "user-a", // (User who sent the message, not the recipient)
-  "message": "base64-encrypted-payload", // (Encrypted message content)
-  "attachments": ["att-91"], // (Identifiers for media metadata referenced by the message)
-  "serverReceivedAt": "2026-08-25T22:10:03.412Z" // (Time the server accepted the original message, not successful device-delivery time)
-}
-```
-
-The recipient is implicit in the WebSocket connection and per-device inbox to
-which this event is sent. Fanout creates a separate delivery event for each
-recipient device. Delivery is confirmed only after that device sends
-`ackEvent`; the server may record that later time separately as
-`acknowledgedAt`.
-
-#### `deliverySeq` and the Per-Device Inbox
-
-`deliverySeq` is assigned when the fanout worker creates an entry in a
-recipient device's **server-side inbox**. It is monotonic within that device's
-event stream, not global and not shared across devices.
-
-For one logical message:
-
-| Recipient device | `eventId` | `deliverySeq` | `messageId` |
-|---|---|---:|---|
-| Bob's phone | `evt-phone-8804` | 8804 | `msg-3021` |
-| Bob's laptop | `evt-laptop-206` | 206 | `msg-3021` |
-| Alice's tablet | `evt-tablet-441` | 441 | `msg-3021` |
-
-- `messageId` remains the same because all rows refer to one logical message.
-- `eventId` and `deliverySeq` differ because each device has its own delivery
-  history.
-- A retry to the same device reuses the existing inbox entry, event ID, and
-  sequence rather than allocating a new sequence.
-- Equal sequence values on two devices would be coincidental and unrelated.
-
-The server stores the message once and creates a lightweight delivery entry
-for each device:
-
-```text
-Message Store:
-  msg-3021 -> encrypted message payload
-
-Server-Side Device Inbox:
-  (phone-b, 8804) -> evt-phone-8804 -> msg-3021
-  (laptop-b, 206) -> evt-laptop-206 -> msg-3021
-```
-
-Delivery lifecycle:
-
-1. Fanout writes one server-side inbox entry per recipient device.
-2. If a device is online, its gateway immediately sends `newMessage`.
-3. The device persists the message in its local message database.
-4. The device sends `ackEvent`.
-5. The server deletes or advances that device's acknowledged inbox entries.
-6. An offline device's inbox entries remain until it reconnects or the
-   retention limit expires.
-
-The device's local database stores chat history for the user. The server-side
-inbox stores only pending delivery state and remains authoritative until the
-device acknowledges receipt.
-
-The source's simplified event response is `"RECEIVED"`. Because WebSocket
-events are asynchronous, a production protocol makes it an explicit command:
-
-```jsonc
-// -> ackEvent
-{
-  "clientId": "laptop-b",
-  "eventId": "evt-7002",
-  "status": "RECEIVED"
-}
-```
-
-For efficiency, a device may cumulatively acknowledge an ordered range:
-
-```jsonc
-// -> ackEvent
-{
-  "clientId": "laptop-b",
-  "ackThroughDeliverySeq": 8804,
-  "status": "RECEIVED"
-}
-```
-
-### Reconnect and Heartbeat Additions
-
-`syncInbox` is initiated by a client after startup, WebSocket reconnection, or
-gap detection. `syncBatch` is the server's paginated response containing events
-from that client's server-side inbox.
-
-Suppose `laptop-b` has durably stored every event through sequence 8802:
-
-```jsonc
-// -> syncInbox
-{
-  "requestId": "sync-20", // (Correlates this request with the returned syncBatch)
-  "clientId": "laptop-b", // (Device whose server-side inbox should be queried)
-  "afterDeliverySeq": 8802, // (Highest sequence already stored locally by this device)
-  "limit": 100 // (Maximum number of events to return in this page)
-}
-```
-
-```jsonc
-// <- syncBatch
-{
-  "requestId": "sync-20", // (Matches the initiating syncInbox request)
-  "events": [
-    {
-      "type": "chatUpdate",
-      "eventId": "evt-7001",
-      "deliverySeq": 8803,
-      "chatId": "chat-7",
-      "chatVersion": 12,
-      "updatedAt": "2026-08-26T22:05:10Z",
-      "name": "Weekend trip",
-      "participants": ["user-a", "user-b", "user-c", "user-d"]
-    },
-    {
-      "type": "newMessage",
-      "eventId": "evt-7002",
-      "deliverySeq": 8804,
-      "messageId": "msg-3021",
-      "chatId": "chat-7",
-      "senderId": "user-a",
-      "message": "base64-encrypted-payload",
-      "attachments": ["att-91"],
-      "serverReceivedAt": "2026-08-25T22:10:03.412Z"
-    }
-  ],
-  "lastDeliverySeq": 8804, // (Highest sequence included in this page)
-  "hasMore": false // (Whether another page remains after lastDeliverySeq)
-}
-```
-
-The server performs the equivalent of:
-
-```text
-query server-side inbox
-where client_id = "laptop-b"
-  and delivery_seq > 8802
-order by delivery_seq
-limit 100
-```
-
-After persisting both events locally, the laptop cumulatively acknowledges the
-page:
-
-```jsonc
-// -> ackEvent
-{
-  "clientId": "laptop-b",
-  "ackThroughDeliverySeq": 8804,
-  "status": "RECEIVED"
-}
-```
-
-If `hasMore` were `true`, the client would request the next page using
-`afterDeliverySeq: 8804`. If it is `false`, the client has caught up and enters
-normal realtime mode.
-
-| Message | Initiator | Purpose |
-|---|---|---|
-| `syncInbox` | Client device | Ask for events after the device's last locally stored sequence |
-| `syncBatch` | Server | Return one ordered page from that device's server-side inbox |
-| `ackEvent` | Client device | Confirm the page was persisted so acknowledged inbox entries can be removed |
-
-```jsonc
-// -> ping
-{
-  "sentAt": "2026-08-25T22:10:10Z"
-}
-```
-
-```jsonc
-// <- pong
-{
-  "sentAt": "2026-08-25T22:10:10Z",
-  "serverTime": "2026-08-25T22:10:10.020Z"
-}
-```
-
-### Command Lifecycle
-
-```mermaid
-flowchart LR
-    C["Client command<br/>createChat / sendMessage / modifyChatParticipants"] --> V["Validate and authorize"]
-    V --> D["Persist state + outbox"]
-    D --> R["Return SUCCESS / FAILURE"]
-    D --> F["Fan out parallel server events"]
-    F --> E["chatUpdate / newMessage"]
-    E --> A["Client sends ackEvent: RECEIVED"]
-    A --> X["Advance or delete device inbox entry"]
-```
-
-Example failure response:
-
-```jsonc
-{
-  "status": "FAILURE",
-  "errorCode": "NOT_CHAT_MEMBER",
-  "retryable": false
-}
-```
-
-### Media HTTP API
-
-```text
-POST /v1/attachments/init
-  -> attachment_id + signed_upload_url
-
-PUT signed_upload_url
-  -> upload encrypted bytes directly to object storage
-
-POST /v1/attachments/{attachment_id}/complete
-  -> validate size/checksum and mark attachment usable
-```
+Recipients obtain a short-lived download URL from the attachment service and
+download the bytes through a CDN.
 
 ## 4. High-Level Design
 
 ```mermaid
 flowchart LR
-    subgraph Clients
-        A["Sender devices"]
-        B["Recipient devices"]
-    end
+    C["Phone / Desktop Clients"] <-->|"TLS WebSocket"| LB["L4 Load Balancer"]
+    LB <--> G["Chat Gateway Fleet"]
+    G --> S["Chat Service"]
 
-    A <-->|"TLS WebSocket"| LB["L4 Load Balancer"]
-    B <-->|"TLS WebSocket"| LB
-    LB <--> G["Chat Gateway Fleet<br/>connections + heartbeats"]
-
-    G --> I["Message Ingest Service"]
-    I --> CDB[("Chat Metadata Store")]
-    I --> MDB[("Message Store")]
-    I --> O[("Transactional Outbox")]
-
-    O --> F["Fanout Workers"]
-    F --> CDB
-    F --> IDB[("Per-Client Inbox Store")]
-    F --> P["Realtime Pub/Sub"]
+    S --> DB[("DynamoDB<br/>chats + messages + clients + outbox")]
+    DB -->|"outbox stream / SQS"| F["Fanout Workers"]
+    F --> DB
+    F --> I[("Per-Client Inbox Store")]
+    F --> P["Redis Pub/Sub<br/>realtime hint"]
     P --> G
+    G <--> I
 
-    G --> IDB
-
-    A --> M["Media API"]
-    M --> S[("Object Storage")]
-    S --> CDN["CDN"]
-    CDN --> B
+    C --> M["Media API"]
+    M --> O[("Object Storage")]
+    O --> CDN["CDN"]
+    CDN --> C
 ```
 
-### Component Responsibilities
+This is one messaging architecture. The four workflows below use subsets of
+the same components rather than introducing separate designs.
 
-| Component | Responsibility |
-|---|---|
-| L4 load balancer | Distribute long-lived TCP/WebSocket connections |
-| Chat gateway | Authenticate sockets, track local connections, push events, process acks |
-| Message ingest | Authorize chat membership, deduplicate, timestamp, persist |
-| Message store | Durable message metadata and ciphertext |
-| Transactional outbox | Ensure accepted messages cannot be lost before fanout |
-| Fanout workers | Resolve recipient devices and create durable inbox entries |
-| Inbox store | Source of truth for unacknowledged delivery per device |
-| Pub/sub | Notify the gateway currently serving a connected user |
-| Media service | Issue signed URLs and validate attachment metadata |
+### Concrete Component Choices
 
-An L7 load balancer can support WebSockets, but L4 is sufficient when no
-path/header routing is required and the connection is long-lived.
-
-The message row and outbox event are logical tables that must share one
-transaction boundary, even if the diagram draws them separately.
-
-## 5. Critical Flows
-
-### 5.0 Create a Chat
-
-1. Validate that the creator is authenticated and the participant count is
-   within the product limit.
-2. Write the chat record and initial memberships atomically when possible, or
-   use an idempotent batched workflow for the largest allowed groups.
-3. Publish `chatUpdate` only after membership state is durable.
-
-### 5.1 Send and Deliver a Message
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant S as Sender
-    participant G as Chat Gateway
-    participant I as Message Ingest
-    participant M as Message DB + Outbox
-    participant F as Fanout Worker
-    participant D as Device Inbox
-    participant P as Pub/Sub
-    participant R as Recipient Gateway
-    participant C as Recipient Device
-
-    S->>G: sendMessage(clientMessageId)
-    G->>I: Authenticated command
-    I->>I: Verify membership and deduplicate
-    I->>M: Atomically persist message + outbox event
-    M-->>I: Durable commit
-    I-->>S: sendMessage SUCCESS(messageId)
-
-    F->>M: Consume outbox event
-    F->>D: Create per-device inbox entries
-    F->>P: Publish realtime notification
-    P-->>R: Notify connected recipient
-    R->>D: Read delivery payload
-    R-->>C: newMessage(deliverySeq)
-    C->>R: ackEvent(ackThroughDeliverySeq)
-    R->>D: Delete or advance acknowledged entries
-```
-
-**Key invariant:** acknowledge the sender only after the message and its outbox
-event are durable. Persist recipient inbox entries before sending the realtime
-notification.
-
-### 5.2 Offline Delivery and Reconnect
-
-```mermaid
-flowchart TD
-    A["Device opens app"] --> B["Connect and authenticate WebSocket"]
-    B --> C["Gateway registers client connection"]
-    C --> D["Client sends last acknowledged delivery_seq"]
-    D --> E["Query inbox entries after that sequence"]
-    E --> F{"More entries?"}
-    F -- "Yes" --> G["Send next ordered page"]
-    G --> H["Client stores messages locally"]
-    H --> I["Client sends cumulative ACK"]
-    I --> J["Delete / advance acknowledged inbox entries"]
-    J --> E
-    F -- "No" --> K["Enter realtime mode"]
-    K --> L["Heartbeat detects stale socket"]
-    L -->|"failure"| A
-```
-
-Inbox records use a TTL so messages that remain undelivered beyond the product
-retention window are removed automatically.
-
-### 5.3 Media Delivery
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant M as Media API
-    participant O as Object Storage
-    participant G as Chat Gateway
-    participant R as Recipient
-    participant CDN as CDN
-
-    C->>M: Initialize attachment metadata
-    M-->>C: attachment_id + signed upload URL
-    C->>O: Upload encrypted bytes directly
-    C->>M: Complete upload with checksum
-    C->>G: sendMessage(attachmentId)
-    G-->>R: Deliver message metadata
-    R->>CDN: Download encrypted object
-```
-
-This keeps large payloads out of gateways, databases, and pub/sub.
-
-## 6. Data Model and Access Patterns
-
-A DynamoDB-like key/value store is one option; the important part is matching
-keys and indexes to access patterns.
-
-| Data | Primary key / ordering | Main access |
+| Component | Default choice | Why / alternative |
 |---|---|---|
-| Chat | `chat_id` | Fetch chat metadata |
-| ChatParticipant | `(chat_id, user_id)` | List users in a chat |
-| Participant GSI | `(user_id, chat_id)` | List chats for a user |
-| Client | `(user_id, client_id)` | Resolve active devices for a user |
-| Message | `(chat_id, server_time#message_id)` | Read chat history in display order |
-| InboxEntry | `(client_id, delivery_seq)` | Replay unacknowledged device messages |
-| Idempotency | `(sender_client_id, client_message_id)` | Deduplicate retries |
-| Attachment | `attachment_id` | Resolve object metadata |
+| Client transport | TLS WebSocket | Persistent bidirectional connection avoids polling; raw TLS TCP is an alternative |
+| Load balancer | L4 network load balancer | Only connection distribution is required; an L7 balancer also works when header or path routing is needed |
+| Chat gateways | Stateful connection servers | Maintain local `(user_id, client_id) -> socket` maps and heartbeat state |
+| Chat and message data | DynamoDB | Horizontal write scaling and direct key access; Cassandra or ScyllaDB are alternatives |
+| Durable fanout | DynamoDB outbox relayed through Streams or polling into SQS | Keeps fanout recoverable without blocking the socket request on every recipient write |
+| Device inbox | DynamoDB keyed by `(client_id, delivery_seq)` | Ordered replay, conditional writes, and 30-day TTL |
+| Realtime routing | Redis Pub/Sub | Very low latency; Kafka or NATS are alternatives, but durability is supplied by the inbox |
+| Client storage | SQLite | Durable local message history and cursor updates in one transaction |
+| Media | S3-compatible object storage plus CDN | Cheap scalable bytes, signed URLs, and edge delivery |
 
-### Why Per-Client Inbox?
+The concrete interview design uses **WebSockets, DynamoDB, an outbox relay,
+SQS, Redis Pub/Sub, SQLite, and S3 plus a CDN**. DynamoDB Streams can wake the
+outbox relay; polling is a simpler alternative. The important design choice is
+the role of each component, not the brand name. The primary store and inbox are
+separate logical DynamoDB tables and may share the same regional cluster.
 
-Suppose Bob has a phone and laptop:
+### 4.1 Workflow for API 1: Create a Chat
+
+```mermaid
+flowchart LR
+    C["Client"] --> G["Chat Gateway"]
+    G --> S["Chat Service"]
+    S --> DB[("Chat + Participant Data")]
+    DB --> F["Fanout Workers"]
+    F --> I[("Client Inboxes")]
+    F --> P["Redis Pub/Sub"]
+    P --> G
+```
+
+1. **Authenticate and validate.** The gateway uses the identity bound to the
+   socket. The service validates unique participants, the 100-user limit, and
+   the creator's permissions.
+2. **Deduplicate the command.** `requestId` is scoped to the requesting client,
+   so a timeout and retry return the original `chatId`.
+3. **Persist membership.** Store the `Chat` and `ChatParticipant` records. A
+   small chat can use a DynamoDB transaction. Near the maximum size, create the
+   chat in `CREATING`, write memberships in idempotent batches, and then change
+   it to `ACTIVE`.
+4. **Index both directions.** Use `(chat_id, user_id)` to list chat members and
+   a GSI on `(user_id, chat_id)` to list a user's chats.
+5. **Notify participants.** Emit a durable `chatUpdate` fanout event. Workers
+   place it in each active client's inbox before publishing the realtime hint.
+
+**Why these choices:** the state transition prevents clients from observing a
+partially created large chat; the two indexes match the required membership
+queries; and routing membership events through the normal inbox path lets an
+offline device learn about the chat later.
+
+### 4.2 Workflow for API 2: Send and Receive a Message
+
+```mermaid
+flowchart LR
+    A["Sender"] --> G["Chat Gateway"]
+    G --> S["Chat Service"]
+    S --> DB[("Message + Outbox")]
+    DB --> F["Fanout Workers"]
+    F --> I[("Per-Client Inboxes")]
+    F --> P["Redis Pub/Sub"]
+    P --> RG["Recipient Gateway"]
+    RG --> B["Recipient Device"]
+    B -->|"ACK"| RG
+    RG --> I
+```
+
+1. **Authorize and deduplicate.** Verify that the sender belongs to the chat,
+   then look up `(sender_client_id, clientMessageId)`. A retry returns the same
+   server `messageId`.
+2. **Accept durably.** In one DynamoDB transaction, store the message and an
+   outbox event. Stamp `serverReceivedAt` using synchronized server time, then
+   return `SUCCESS`.
+3. **Resolve fanout.** Workers load chat participants and each user's active
+   clients. They include the sender's other devices so all of the sender's
+   clients remain synchronized.
+4. **Write before publishing.** For every destination client, create one
+   idempotent inbox entry. A DynamoDB transaction conditionally creates a
+   `(client_id, message_id)` dedupe marker, advances that client's sequence,
+   and writes the inbox row at the new `deliverySeq`.
+5. **Take the fast path.** After the inbox write succeeds, publish to the
+   recipient user's Redis topic. The gateway subscribed for that connected
+   user pushes `newMessage` over the correct device sockets.
+6. **Acknowledge safely.** The client stores the message and cursor in one
+   SQLite transaction, then sends `ackEvent`. The server removes or advances
+   the acknowledged inbox entries.
+
+**Why these choices:** WebSockets and Redis minimize online latency; the
+DynamoDB message and inbox records survive gateway or Redis failure; fanout
+workers keep group expansion off the sender's latency path; and per-client
+acknowledgements let a phone and laptop advance independently.
+
+### 4.3 Workflow for API 3: Replay Offline Messages
+
+```mermaid
+flowchart LR
+    C["Reconnecting Device"] --> G["Chat Gateway"]
+    G --> I[("Per-Client Inbox")]
+    I --> G
+    G --> C
+    C --> L[("Local SQLite")]
+    C -->|"Cumulative ACK"| G
+    G --> I
+```
+
+1. **Resume the device, not only the user.** After authentication, the gateway
+   identifies the exact `client_id`. Bob's phone and laptop have independent
+   inboxes and cursors.
+2. **Request after the local cursor.** The device sends its highest contiguous,
+   durably stored `deliverySeq`.
+3. **Read ordered pages.** Query DynamoDB where `client_id` matches and
+   `delivery_seq` is greater than the cursor, ordered ascending with a bounded
+   page size. If the cursor predates retention, report the oldest available
+   sequence and a history-truncated flag.
+4. **Persist before acknowledging.** The device writes the batch and updated
+   cursor in one SQLite transaction. It acknowledges only the highest
+   contiguous sequence, never skipping a gap unless the server explicitly
+   identifies it as expired history.
+5. **Advance server state.** The gateway deletes acknowledged rows or advances
+   a compact inbox cursor. It repeats until `hasMore` is false.
+6. **Expire abandoned work.** Entries become ineligible after 30 days;
+   DynamoDB TTL and a sweeper remove them physically, and inactive clients are
+   eventually revoked.
+
+**Why these choices:** a per-client inbox prevents one online device from
+deleting another device's pending work; pagination bounds memory and response
+size; a cumulative ACK reduces write volume; and the local transaction
+prevents a crash between storing a message and advancing the cursor.
+
+An alternative is one sequence per chat plus one cursor per `(client, chat)`.
+The per-client delivery sequence is convenient because one cursor replays
+messages and control events across every chat.
+
+### 4.4 Workflow for API 4: Send and Receive Media
+
+```mermaid
+flowchart LR
+    A["Sender"] --> M["Media API"]
+    M --> O[("Object Storage")]
+    A -->|"sendMessage(attachmentId)"| G["Chat Gateway"]
+    G --> B["Recipient"]
+    B --> CDN["CDN"]
+    CDN --> O
+```
+
+1. **Initialize metadata.** The authenticated client sends content type, size,
+   and checksum to the media API.
+2. **Upload directly.** The API returns an `attachmentId` and short-lived signed
+   URL. The client uploads encrypted bytes directly to S3, bypassing chat
+   gateways and DynamoDB.
+3. **Complete the upload.** The media service verifies object existence, size,
+   and checksum before changing the attachment from `UPLOADING` to `READY`.
+4. **Send only a reference.** A normal `sendMessage` contains the
+   `attachmentId`. The chat service rejects attachments that are not ready or
+   do not belong to the sender.
+5. **Download from the edge.** Recipients obtain authorized signed download
+   URLs and fetch through the CDN.
+
+**Why these choices:** object storage is cheaper and more scalable for large
+bytes; signed URLs keep application servers off the data path; the completion
+step prevents messages from referencing partial files; and a CDN reduces
+latency and repeated origin bandwidth.
+
+## 5. Shared Message and Delivery Semantics
+
+These identifiers solve different problems:
+
+| Identifier | Scope and purpose |
+|---|---|
+| `requestId` | Correlates one WebSocket command and response |
+| `clientMessageId` | Makes a sender-device retry idempotent |
+| `messageId` | Identifies one logical message shared by all recipients |
+| `eventId` | Identifies one delivery event for one destination client |
+| `deliverySeq` | Orders one client's unified replay stream and supports cumulative ACKs |
+
+The sender and recipient confirmations also mean different things:
 
 ```text
-Bob's phone receives msg-10 and acknowledges it.
-Bob's laptop is offline.
+sendMessage SUCCESS
+  = message + durable fanout intent committed
+
+ackEvent RECEIVED
+  = this client durably stored events through deliverySeq N
 ```
 
-A user-level inbox would delete `msg-10` too early. Per-client inboxes allow
-the phone to advance independently while preserving the laptop's pending
-delivery.
+Device delivery is **at least once**. If an ACK is lost, the server may replay
+the event. Clients deduplicate by `messageId` or `eventId` and acknowledge it
+again.
+
+Strict global ordering is unnecessary. Stamp messages with synchronized server
+receive time and display by `(serverReceivedAt, messageId)`. This favors low
+latency but can occasionally insert a late message above one already shown. If
+the product requires a stable total order inside each chat, add a `chatSeq`
+assigned by the chat's partition leader at the cost of a potential hot
+partition and reduced availability during leader failure.
+
+## 6. Data Model
+
+DynamoDB is a reasonable default because the dominant operations are
+high-volume key lookups and ordered partition queries.
+
+| Data | Key / index | Main access |
+|---|---|---|
+| `Chat` | PK `chat_id` | Fetch chat metadata and version |
+| `ChatParticipant` | PK `(chat_id, user_id)` | List members of a chat |
+| Participant GSI | `(user_id, chat_id)` | List chats for a user |
+| `Client` | PK `(user_id, client_id)` | Resolve active devices for a user |
+| `Message` | PK `message_id`; GSI `(chat_id, server_time#message_id)` | Fetch payload or read ordered chat history |
+| `InboxEntry` | PK `(client_id, delivery_seq)` | Replay pending device events |
+| `InboxDedupe` | PK `(client_id, message_id)` | Conditionally map one logical message to one client delivery sequence |
+| `SendIdempotency` | PK `(sender_client_id, client_message_id)` | Return the original result for retries |
+| `Attachment` | PK `attachment_id` | Validate ownership, state, and object metadata |
+| `OutboxEvent` | PK `event_id`; GSI `(state#outbox_shard, created_at#event_id)` | Scan pending fanout work without one hot unpublished partition |
 
 ### Retention
 
-- Inbox entries expire after the offline-delivery window.
-- Message payloads remain available while a live inbox entry can reference
-  them, then expire or are deleted after all active devices acknowledge them.
-- Chat history is primarily stored on clients unless the product explicitly
-  requires longer centralized retention.
-- Attachment lifecycle is managed separately in object storage.
+- Give every inbox entry a `deliver_until` timestamp 30 days after acceptance.
+  Reads reject an entry immediately after that time.
+- Keep a message payload while a nonexpired inbox entry can reference it, but
+  never make it deliverable after `deliver_until`. An asynchronous sweeper
+  removes expired inbox and message rows.
+- DynamoDB TTL performs eventual physical deletion, not exact-time deletion.
+  If strict deletion at 30 days is required, run an explicit deletion job in
+  addition to TTL.
+- Remove or revoke inactive clients so abandoned devices do not generate
+  unnecessary inbox writes.
+- Keep long-term chat history primarily in each client's SQLite database unless
+  the product explicitly requires centralized history.
+- Apply separate S3 lifecycle rules to attachments and delete incomplete
+  uploads quickly.
 
 ## 7. Deep Dives
 
-### 7.1 Scaling Persistent Connections
+Each deep dive corresponds directly to one non-functional requirement:
 
-Each gateway keeps a local map:
+| Non-functional requirement | Deep dive |
+|---|---|
+| Reliability | 7.1 Durable delivery across failures and multiple devices |
+| Online latency | 7.2 WebSocket fast path and connection health |
+| Scale | 7.3 Persistent connections, routing, and fanout |
+| Retention efficiency | 7.4 Inbox, message, and media lifecycle |
+
+### 7.1 Reliability: How Do We Deliver Across Failures and Devices?
+
+**Addresses:** eventual delivery to every active client despite gateway,
+worker, pub/sub, or network failures.
+
+The durable path and realtime path have different responsibilities:
+
+```text
+Durable path:
+message + outbox -> fanout worker -> per-client inbox
+
+Fast path:
+per-client inbox -> Redis Pub/Sub -> gateway -> WebSocket
+```
+
+Important invariants:
+
+1. Acknowledge the sender only after the message and fanout intent commit.
+2. Make fanout idempotent with a conditional `(client_id, message_id)` marker.
+3. Write each inbox entry before publishing its realtime hint.
+4. Let a client ACK only after its local transaction commits.
+5. Delete pending delivery state only for the client that acknowledged it.
+
+Redis Pub/Sub is at-most-once and can drop a hint when there is no subscriber
+or a broker fails. The inbox still contains the event, so reconnect sync,
+sequence-gap detection, and periodic polling recover it.
+
+Multiple devices require a `Client` table and one inbox per client. Fanout
+targets every active client, including the sender's other devices. Bound the
+number of linked clients, such as three per account, and explicitly revoke old
+devices.
+
+An ACK loss can cause a duplicate delivery. That is preferable to loss:
+clients deduplicate and ACK again. These are at-least-once, not exactly-once,
+semantics.
+
+### 7.2 Online Latency: How Do We Stay Below 500 ms?
+
+**Addresses:** fast delivery when sender and recipient are connected.
+
+WebSockets avoid a new HTTP/TLS handshake or polling delay for every message.
+Each gateway holds a local map:
 
 ```text
 user_id -> [(client_id, websocket), ...]
 ```
 
-Gateways subscribe to realtime topics for locally connected users. A message
-for User B can arrive at any ingest node, be published to User B's topic, and
-reach whichever gateways currently host B's devices.
-
-Operational considerations:
-
-- Heartbeats remove dead sockets faster than TCP keepalive alone.
-- Gateways stop accepting new connections and drain existing ones during
-  deployment.
-- Reconnect jitter prevents a failed gateway from causing a connection storm.
-- Connection counts, outbound buffers, and slow consumers need hard limits.
-
-### 7.2 Pub/Sub Is Not the Durability Layer
-
-An in-memory pub/sub system may drop a notification when:
-
-- No gateway is subscribed.
-- A broker fails.
-- A gateway is disconnected or overloaded.
-
-That is acceptable because the inbox entry already exists.
-
-Recovery layers:
-
-1. Heartbeats detect dead WebSockets.
-2. Delivery sequence numbers reveal gaps.
-3. Reconnect replays the inbox.
-4. Periodic inbox sync is the final backstop.
-
-The resulting client semantics are **at least once**. Clients deduplicate using
-`message_id`.
-
-### 7.3 Ordering
-
-Strict global ordering is unnecessary and expensive. Two practical choices:
-
-| Option | Benefit | Cost |
-|---|---|---|
-| Server receive timestamp | Simple and low latency | Clock skew and occasional visual reordering |
-| Per-chat sequence from one partition leader | Stable total order inside a chat | Hot-chat bottleneck and reduced availability during leader failure |
-
-Example:
+Gateways subscribe to Redis topics for the users currently connected to them.
+The online path is:
 
 ```text
-M1 reaches the server at 10:00:03.110 -> chat_seq 42
-M2 reaches the server at 10:00:03.125 -> chat_seq 43
+sender socket -> chat service -> durable write -> inbox fanout
+              -> Redis hint -> recipient gateway -> recipient socket
 ```
 
-Devices display `42` before `43` even if retries cause `43` to arrive first.
-For a simpler interview design, server-received time synchronized with NTP is
-often sufficient; introduce per-chat sequencing only when the interviewer
-requires stronger ordering.
+Keep the latency path small:
 
-### 7.4 User Topics vs. Chat Topics
+- Reuse database and Redis connections.
+- Cache chat membership briefly with version-based invalidation.
+- Publish IDs and small metadata rather than media bytes.
+- Bound gateway output buffers and disconnect slow consumers so they recover
+  through inbox replay.
+- Measure durable-commit, fanout, pub/sub, and socket latency separately.
 
-| Routing strategy | Works well when | Problem |
-|---|---|---|
-| Per-user topic | Chats are mostly one-to-one or small | Large groups require many publishes |
-| Per-chat topic | Groups are large | Users with many small chats require many subscriptions |
-| Adaptive hybrid | Workload is mixed | Membership changes require careful transition |
+Application-level `ping` and `pong` heartbeats detect half-open connections
+faster than TCP keepalive. A missed heartbeat closes the socket and triggers
+reconnect with randomized delay, preventing a failed gateway from causing a
+simultaneous reconnect storm.
 
-Hybrid example:
+Do not delay the realtime path to enforce perfect cross-server ordering.
+Server receive timestamps give a stable-enough display order without waiting
+for potentially late messages.
+
+### 7.3 Scale: How Do We Handle Connections, Routing, and Fanout?
+
+**Addresses:** roughly 200 million concurrent sockets, 46,000 average
+messages/second, and approximately 100,000 database writes/second.
+
+Scale gateways horizontally. The L4 load balancer distributes new connections,
+while each established WebSocket remains pinned to one gateway. Gateways
+should drain during deploys, cap connections and memory, and add reconnect
+jitter after failures.
+
+When sender and recipient use different gateways, Redis routes the realtime
+hint. Use Redis Cluster or consistent hashing so publishers and subscriber
+gateways route a topic to the same shard. Use **per-user topics** by default:
 
 ```text
-Small chat -> fanout to recipient user topics.
-Large chat -> gateways subscribe to a shared chat topic.
-Transition -> temporarily publish through both paths and deduplicate.
+message for Bob -> publish to user:Bob
+gateways hosting Bob's devices -> subscribed to user:Bob
 ```
 
-### 7.5 Fanout and Hot Chats
+Per-user topics fit a workload dominated by one-to-one and small chats. A
+per-chat topic reduces publishes for a large group but forces every connected
+user to maintain many chat subscriptions. An adaptive option is:
 
-Do not create hundreds of inbox rows synchronously in the sender request.
-Persist one message/outbox event and let horizontally scaled workers fan out.
+```text
+small chat -> recipient user topics
+large chat -> one chat topic
+```
 
-Protections:
+During a routing-mode transition, briefly publish through both paths and
+deduplicate by `eventId`.
 
-- Partition fanout work by `chat_id` or `message_id`.
-- Rate-limit exceptionally active chats.
-- Process recipients in chunks.
-- Make inbox insertion idempotent on `(client_id, message_id)`.
-- Monitor fanout lag separately from ingest latency.
+Keep fanout off the sender's request thread. SQS or DynamoDB Streams partitions
+work across horizontally scaled workers. Workers process participant and
+client batches, and DynamoDB distributes inbox writes by `client_id`. Monitor
+fanout age separately from message-ingest latency.
 
-### 7.6 Multiple Devices
+The 100-participant limit bounds worst-case work. Rate-limit unusually active
+chats and clients so a hot partition or abusive sender cannot consume an
+entire shard.
 
-- Track a bounded number of active clients per user.
-- Fan out to every active client, including the sender's other devices.
-- Store delivery state per client.
-- Expire or explicitly revoke inactive devices.
-- Use cumulative acknowledgements to reduce write volume.
+### 7.4 Retention: How Do We Minimize Centralized Storage?
 
-### 7.7 Failure Matrix
+**Addresses:** retaining undelivered data for no more than 30 days and keeping
+large media outside the message database.
 
-| Failure | User-visible behavior | Recovery |
-|---|---|---|
-| Gateway crashes | Socket disconnects | Reconnect and replay device inbox |
-| Pub/sub drops event | Online notification may be late | Inbox sync eventually delivers it |
-| Fanout worker crashes | Message accepted but not yet distributed | Durable outbox retries |
-| Duplicate client retry | Could create duplicate message | Idempotency record returns original result |
-| Recipient ACK is lost | Message may be delivered again | Client deduplicates and ACKs again |
-| Slow recipient | Gateway buffer grows | Bound buffer, disconnect, then use inbox replay |
-| Media upload is incomplete | Message must not reference unusable media | Require completed attachment state |
+The server-side inbox is pending delivery state, not permanent history:
 
-### 7.8 Presence / Last Seen (Optional)
+```text
+ACK received       -> remove inbox entry
+deliver_until reached -> expire inbox entry
+client revoked     -> stop new fanout and clean remaining entries
+```
 
-Gateways refresh short-lived presence records from heartbeats. When all of a
-user's clients disconnect or expire, asynchronously persist a rate-limited
-`last_seen_at` value. Presence is best-effort and should never be on the
-message-delivery critical path.
+If expiry removes an event before an inactive device reconnects, `syncBatch`
+returns the oldest available sequence and `historyTruncated: true`. The device
+can then reset its replay baseline explicitly; an unexplained gap still
+triggers recovery.
 
-## 8. Main Design Decisions
+Store one message payload and let lightweight inbox rows reference it. Do not
+delete the payload until all possible live references have been acknowledged
+or expired. At scale, use a conservative message TTL slightly beyond the inbox
+window plus asynchronous cleanup rather than a synchronous global reference
+count on every ACK.
+
+Clients keep their own durable chat history in SQLite. This reduces centralized
+retention and makes ordinary history reads local. A newly linked device can
+receive only the history allowed by the product's bootstrap and retention
+policy.
+
+Store attachment bytes in S3, not DynamoDB or Redis. Apply lifecycle rules to
+abandoned uploads and expired media, serve downloads through a CDN, and keep
+only attachment metadata in chat messages. End-to-end encrypted deployments
+store opaque ciphertext on the server.
+
+## 8. Important Tradeoffs and Failures
+
+| Situation | Decision |
+|---|---|
+| Gateway crashes | Client reconnects with jitter and replays its device inbox |
+| Redis drops a realtime hint | Sequence gap or periodic inbox sync recovers the event |
+| Fanout worker crashes | Durable outbox or stream redelivers; conditional inbox dedupe prevents duplicate rows |
+| Sender retries after a timeout | `clientMessageId` returns the original message |
+| Recipient ACK is lost | Event may replay; client deduplicates and ACKs again |
+| One device is offline | Its inbox remains independent of the user's online devices |
+| Client is too slow | Bound the gateway buffer, disconnect, and use replay |
+| Messages arrive out of order | Display by server receive time; add per-chat sequence only if required |
+| Media upload is incomplete | Reject the attachment reference until state is `READY` |
+| Client stays inactive over 30 days | Expire its pending inbox entries and require normal resynchronization |
+
+The central tradeoff is **durable at-least-once delivery versus a lightweight
+low-latency fast path**. The inbox prevents loss; Redis and WebSockets avoid
+making every connected device poll.
+
+## 9. Main Design Decisions
 
 | Decision | Why |
 |---|---|
-| WebSockets for chat commands | Low-latency bidirectional communication |
-| HTTP + object storage for media | Keeps large bytes off the chat path |
-| Durable inbox before realtime publish | Pub/sub loss cannot lose accepted messages |
-| Inbox per client | Independent synchronization for multiple devices |
-| Transactional outbox | Atomic boundary between message acceptance and asynchronous fanout |
-| At-least-once device delivery | Practical reliability with client deduplication |
-| Server time or optional chat sequence | Avoid expensive global ordering |
-| Adaptive pub/sub partitioning | Efficient for both small and unusually large groups |
+| TLS WebSockets | Low-latency bidirectional commands and events |
+| L4 load balancer | Efficiently distributes long-lived connections without unnecessary HTTP routing |
+| DynamoDB chat and inbox data | Scales key-based reads and high-volume writes horizontally |
+| Message plus transactional outbox | Accepted messages cannot disappear before fanout |
+| Per-client inbox | Phones and computers synchronize independently |
+| Inbox before Redis publish | Pub/sub loss delays but cannot lose delivery |
+| Outbox relayed to SQS fanout | Group and multi-device expansion stays recoverable and off the sender path |
+| Redis per-user topics | Efficient routing for mostly one-to-one and small chats |
+| Server timestamp by default | Avoids strict-order coordination on the latency path |
+| Signed S3 upload plus CDN | Keeps large media bytes off gateways, queues, and databases |
 
-## 9. End-to-End Example
-
-Alice sends a message to Bob while Bob's phone is online and laptop is offline:
-
-1. Alice sends `clientMessageId=phone-a:1042`.
-2. The ingest service persists `msg-3021` and an outbox event.
-3. Alice receives a successful `sendMessage` response.
-4. Fanout creates one inbox entry for Bob's phone and one for his laptop.
-5. Pub/sub wakes the gateway hosting Bob's phone.
-6. The phone receives and acknowledges the message; its inbox entry is removed.
-7. The laptop entry remains.
-8. Hours later, the laptop reconnects with its last acknowledged sequence.
-9. The gateway replays `msg-3021`; the laptop acknowledges it.
-
-If pub/sub fails at step 5, the phone still receives the message during its
-next inbox sync.
-
-## 10. Discussion Prompts
-
-1. When should the sender receive success: after message persistence, after
-   inbox fanout, or after recipient delivery?
-2. How would the design change for groups with millions of members?
-3. Is Redis Pub/Sub sufficient, or should realtime routing use a durable log?
-4. What consistency is required when users are added to or removed from chats?
-5. How should a device prove it may decrypt an old message after being linked?
-6. Would you choose server timestamps or per-chat sequence numbers?
-7. How would you partition the system into regions or failure-isolated cells?
-8. What happens when inbox fanout is delayed for several minutes?
-
-## 11. Suggested 30-Minute Walkthrough
+## 10. Suggested 60-Minute Interview Walkthrough
 
 | Time | Topic |
 |---:|---|
-| 0-3 min | Scope, requirements, and scale |
-| 3-6 min | Entities and interfaces |
-| 6-11 min | High-level architecture |
-| 11-17 min | Send, delivery, and offline replay |
-| 17-21 min | Media and multi-device behavior |
-| 21-27 min | Scaling, ordering, and failure handling |
-| 27-30 min | Tradeoffs and interviewer-selected deep dive |
+| 0-5 min | Clarify group size, offline window, multiple devices, and delivery meaning |
+| 5-10 min | Functional requirements, four NFRs, and capacity |
+| 10-15 min | Core entities and WebSocket/HTTP APIs |
+| 15-20 min | Draw the shared high-level design |
+| 20-24 min | Workflow 1: create a chat |
+| 24-31 min | Workflow 2: send and receive online |
+| 31-36 min | Workflow 3: reconnect and replay |
+| 36-40 min | Workflow 4: media upload and download |
+| 40-46 min | Deep dive 1: reliable multi-device delivery |
+| 46-51 min | Deep dive 2: low latency and connection health |
+| 51-56 min | Deep dive 3: connection, routing, and fanout scale |
+| 56-59 min | Deep dive 4: retention and storage lifecycle |
+| 59-60 min | Summarize invariants and tradeoffs |
+
+If time is limited, prioritize inbox-before-publish, per-client ACK state,
+gateway/pub-sub routing, and direct media upload. Presence, strict ordering,
+long-term server history, and full encryption key management are follow-ups.
 
 ## References
 
 - [Hello Interview: Design WhatsApp][source]
 - [RFC 6455: The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455)
+- [Amazon DynamoDB Developer Guide](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html)
+- [Redis Pub/Sub delivery semantics](https://redis.io/docs/latest/develop/interact/pubsub/)
+- [Amazon S3 presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)
 - [Transactional Outbox Pattern](https://microservices.io/patterns/data/transactional-outbox.html)
